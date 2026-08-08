@@ -1,0 +1,10 @@
+bundle:
+  name: weather-intelligence
+
+workspace:
+  host: https://dbc-1e8b237a-8e29.cloud.databricks.com
+
+targets:
+  default:
+    workspace:
+      host: https://dbc-1e8b237a-8e29.cloud.databricks.com
