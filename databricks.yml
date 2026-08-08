@@ -4,3 +4,5 @@ targets:
     default: true
     workspace:
       host: https://dbc-1e8b237a-8e29.cloud.databricks.com
+bundle:
+  name: weather-intelligence-pipeline
