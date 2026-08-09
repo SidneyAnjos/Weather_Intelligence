@@ -62,7 +62,7 @@ def _get_param(name: str, default: str) -> str:
 def main(locations, limit, batch_size, dry_run):
     import weather_client
     from lakebase import init_weather_schema, upsert_documents
-    import ingest_weather_embeddings as embed_job
+    import notebooks.ingest_weather_embeddings as embed_job
 
     logger.info("=== Weather pipeline job starting ===")
     logger.info("Locations: %s", locations)
