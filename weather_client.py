@@ -1,18 +1,25 @@
 """
 weather_client.py
 
-Client for the OpenWeatherMap One Call API 3.0 (openweathermap.org).
-Requires a free API key (set OPENWEATHER_API_KEY). Mirrors the shape of
-massive_client.py: resolve locations, fetch raw records, normalize into
-the shared document schema used by weather_documents.
+Harvests unstructured weather narrative text from the National Weather
+Service (NWS) API -- free, no API key, no subscription, no credit card.
+Free-text location names ("Chicago", "City, FullState") are resolved to
+lat/lon via the OpenWeatherMap Geocoding API, which is a separate free
+endpoint that does NOT require the paid/One-Call plan (or card
+verification).
 
-Two narrative text sources map cleanly onto source_type:
-  - "alert"    -> the `description` field of each active government alert
-  - "forecast" -> the `summary` field of each daily forecast entry, which
-                  OpenWeatherMap generates as an actual prose sentence
-                  (e.g. "There will be clear sky until morning, then
-                  partly cloudy"), unlike the short "clear sky" tag in
-                  `weather[].description`.
+Why NWS instead of OpenWeatherMap One Call 3.0? One Call 3.0 -- the
+endpoint that returns OpenWeatherMap's prose forecast `summary` and
+government alert text -- now requires a (card-verified) subscription even
+on the free tier. NWS returns the same two flavors of real narrative for
+free:
+
+  - "alert"    -> active government alert `description` (plus `instruction`
+                  when present): multi-sentence hazard guidance
+  - "forecast" -> each forecast period's `detailedForecast`, which is real
+                  prose (e.g. "Showers and thunderstorms likely after noon.
+                  Partly sunny. High near 81..."), unlike the short tags in
+                  the free OWM endpoints.
 
 Public entry point: sync_locations(locations, limit) -> List[dict]
 """
@@ -29,10 +36,16 @@ import requests
 logger = logging.getLogger(__name__)
 
 GEO_URL = "https://api.openweathermap.org/geo/1.0/direct"
-ONECALL_URL = "https://api.openweathermap.org/data/3.0/onecall"
+NWS_BASE = "https://api.weather.gov"
+# NWS requires a descriptive User-Agent; a bare client gets 403s.
+NWS_USER_AGENT = "weather-intelligence-homework (md.258@outlook.com)"
 REQUEST_TIMEOUT = 15  # seconds
 
-UNITS = os.environ.get("OPENWEATHER_UNITS", "imperial")  # imperial | metric | standard
+API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
+
+
+class WeatherClientError(Exception):
+    pass
 
 
 def _decode_key_if_base64(raw: str) -> str:
@@ -58,29 +71,62 @@ def _decode_key_if_base64(raw: str) -> str:
 API_KEY = _decode_key_if_base64(os.environ.get("OPENWEATHER_API_KEY", ""))
 
 
-class OpenWeatherClientError(Exception):
-    pass
+def needs_geocoding(locations: List[str]) -> bool:
+    """
+    True if any location is a free-text place name rather than a numeric
+    "lat,lon" pair. Only text locations need OPENWEATHER_API_KEY.
+    """
+    for location in locations:
+        location = (location or "").strip()
+        if "," in location:
+            parts = [p.strip() for p in location.split(",")]
+            if len(parts) == 2:
+                try:
+                    float(parts[0]), float(parts[1])
+                    continue  # numeric lat,lon -- no geocoding needed
+                except ValueError:
+                    pass
+        return True
+    return False
 
 
 def _require_api_key():
     if not API_KEY:
-        raise OpenWeatherClientError(
-            "OPENWEATHER_API_KEY is not set. Get a free key at "
-            "https://openweathermap.org/api and export it before running sync."
+        raise WeatherClientError(
+            "OPENWEATHER_API_KEY is not set. It's only needed to geocode "
+            "place-name locations to lat/lon (NWS itself needs no key). "
+            "Either set the key or pass 'lat,lon' locations directly."
         )
 
 
 def _get(url: str, params: dict) -> dict:
+    """OpenWeatherMap Geocoding GET (only used for place-name resolution)."""
     _require_api_key()
     params = {**params, "appid": API_KEY}
     resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
     if resp.status_code == 401:
-        raise OpenWeatherClientError(
+        raise WeatherClientError(
             "401 from OpenWeatherMap -- check OPENWEATHER_API_KEY is valid "
             "and (for new keys) has finished activating (~10 min-2 hr)."
         )
     if resp.status_code == 404:
-        raise OpenWeatherClientError(f"404 from OpenWeatherMap: {url}")
+        raise WeatherClientError(f"404 from OpenWeatherMap: {url}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _nws_get(url: str) -> dict:
+    """NWS GET -- the data source itself needs no auth, just a User-Agent."""
+    resp = requests.get(
+        url,
+        headers={"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if resp.status_code == 403:
+        raise WeatherClientError(
+            "403 from NWS -- the API rejects requests without a descriptive "
+            "User-Agent (see NWS_USER_AGENT)."
+        )
     resp.raise_for_status()
     return resp.json()
 
@@ -91,9 +137,9 @@ def _get(url: str, params: dict) -> dict:
 
 def resolve_location(location: str) -> Optional[Dict]:
     """
-    Accepts either "lat,lon" or a free-text place name ("City, ST" /
-    "City, Country"). Numeric "lat,lon" is resolved locally; anything
-    else is geocoded via OpenWeatherMap's Geocoding API.
+    Accepts either "lat,lon" or a free-text place name ("City", "City, ST" /
+    "City, Country"). Numeric "lat,lon" is resolved locally; anything else
+    is geocoded via OpenWeatherMap's (free, key-only) Geocoding API.
     """
     location = location.strip()
 
@@ -108,7 +154,7 @@ def resolve_location(location: str) -> Optional[Dict]:
 
     try:
         data = _get(GEO_URL, {"q": location, "limit": 1})
-    except (OpenWeatherClientError, requests.RequestException) as e:
+    except (WeatherClientError, requests.RequestException) as e:
         logger.warning("Geocoding failed for %r: %s", location, e)
         return None
 
@@ -130,18 +176,32 @@ def resolve_location(location: str) -> Optional[Dict]:
     }
 
 
-def fetch_onecall(lat: float, lon: float) -> dict:
+# ---------------------------------------------------------------------------
+# NWS harvest
+# ---------------------------------------------------------------------------
+
+def fetch_nws_forecast(lat: float, lon: float) -> List[dict]:
     """
-    GET /data/3.0/onecall -> current + daily forecast (with narrative
-    `summary`) + active government alerts. minutely/hourly are excluded
-    since we don't need them for this pipeline.
+    Resolve the lat/lon to its NWS gridpoint, then fetch the multi-day
+    forecast. Returns the list of period dicts -- each carries
+    `detailedForecast`, the prose narrative we embed.
     """
-    return _get(ONECALL_URL, {
-        "lat": lat,
-        "lon": lon,
-        "units": UNITS,
-        "exclude": "minutely,hourly",
-    })
+    lat4, lon4 = round(lat, 4), round(lon, 4)
+    points = _nws_get(f"{NWS_BASE}/points/{lat4},{lon4}")
+    forecast_url = points["properties"]["forecast"]
+    data = _nws_get(forecast_url)
+    return data.get("properties", {}).get("periods", [])
+
+
+def fetch_nws_alerts(lat: float, lon: float) -> List[dict]:
+    """
+    Active government alerts within range of the lat/lon point. Returns the
+    list of alert `properties` dicts (event, description, instruction, ...).
+    May be empty -- that just means no active alerts for the area.
+    """
+    lat4, lon4 = round(lat, 4), round(lon, 4)
+    data = _nws_get(f"{NWS_BASE}/alerts/active?point={lat4},{lon4}")
+    return [f["properties"] for f in data.get("features", [])]
 
 
 # ---------------------------------------------------------------------------
@@ -154,17 +214,23 @@ def _stable_hash(*parts: str) -> str:
 
 
 def normalize_alert(alert: dict, location_label: str) -> Optional[dict]:
-    narrative = (alert.get("description") or "").strip()
+    """
+    NWS alert `properties` -> document dict. The narrative is the alert
+    `description` (multi-sentence hazard text), with `instruction`
+    appended when present. Id is stable across re-syncs so upserts dedupe.
+    """
+    event = (alert.get("event") or "Weather Alert").strip()
+    description = (alert.get("description") or "").strip()
+    instruction = (alert.get("instruction") or "").strip()
+
+    narrative = description
+    if instruction and instruction != description:
+        narrative = f"{description}\n\n{instruction}".strip()
     if not narrative:
         return None
 
-    event = alert.get("event", "Weather Alert")
-    start = alert.get("start")  # unix timestamp
-    alert_id = _stable_hash(location_label, event, alert.get("sender_name"), start)
-
-    issued_at = (
-        datetime.fromtimestamp(start, tz=timezone.utc).isoformat()
-        if start is not None else None
+    alert_id = _stable_hash(
+        location_label, event, alert.get("senderName"), alert.get("effective")
     )
 
     return {
@@ -173,59 +239,49 @@ def normalize_alert(alert: dict, location_label: str) -> Optional[dict]:
         "source_type": "alert",
         "headline": event,
         "narrative_text": narrative,
-        "issued_at": issued_at,
+        "issued_at": alert.get("effective"),
         "payload": alert,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def normalize_forecast_day(day: dict, location_label: str, lat: float, lon: float) -> Optional[dict]:
+def normalize_forecast_period(period: dict, location_label: str,
+                              lat: float, lon: float) -> Optional[dict]:
     """
-    OpenWeatherMap's daily `summary` is genuine prose -- e.g. "Expect a
-    day of partly cloudy with rain" -- which is exactly the free-text we
-    want to embed. Falls back to the short weather[].description if a
-    plan/response doesn't include `summary`.
+    NWS forecast period -> document dict. The narrative is the
+    `detailedForecast` prose ("Showers and thunderstorms likely after
+    noon..."), falling back to the short `shortForecast` tag. Id is stable
+    across re-syncs (location + period startTime).
     """
-    narrative = (day.get("summary") or "").strip()
-    if not narrative and day.get("weather"):
-        narrative = (day["weather"][0].get("description") or "").strip()
+    narrative = (period.get("detailedForecast") or "").strip()
+    if not narrative:
+        narrative = (period.get("shortForecast") or "").strip()
     if not narrative:
         return None
 
-    dt = day.get("dt")  # unix timestamp, noon of the forecast day
-    dedup_key = _stable_hash(location_label, f"{lat:.4f}", f"{lon:.4f}", dt)
-
-    issued_at = (
-        datetime.fromtimestamp(dt, tz=timezone.utc).isoformat()
-        if dt is not None else None
-    )
-
-    headline = None
-    if day.get("weather"):
-        headline = day["weather"][0].get("main")
-    if issued_at:
-        day_label = datetime.fromtimestamp(dt, tz=timezone.utc).strftime("%A")
-        headline = f"{day_label}: {headline}" if headline else day_label
+    start = period.get("startTime")
+    dedup_key = _stable_hash(location_label, f"{lat:.4f}", f"{lon:.4f}", start)
 
     return {
         "id": f"forecast:{dedup_key}",
         "location": location_label,
         "source_type": "forecast",
-        "headline": headline,
+        "headline": period.get("name"),
         "narrative_text": narrative,
-        "issued_at": issued_at,
-        "payload": day,
+        "issued_at": start,
+        "payload": period,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def sync_locations(locations: List[str], limit: int = 50) -> List[dict]:
     """
-    Given a list of "City, ST"/"City, Country" or "lat,lon" strings,
-    resolves each, fetches alerts + daily forecast via One Call, and
-    normalizes everything into document dicts (up to `limit` total).
+    Given a list of "City" / "City, ST" / "City, Country" or "lat,lon"
+    strings, resolves each, fetches NWS forecast periods + active alerts,
+    and normalizes everything into document dicts (up to `limit` total).
 
-    This is the function the /weather/sync endpoint calls.
+    This is the function the /weather/sync endpoint and the scheduled job
+    call.
     """
     documents: List[dict] = []
 
@@ -236,18 +292,19 @@ def sync_locations(locations: List[str], limit: int = 50) -> List[dict]:
         lat, lon, location_label = resolved["lat"], resolved["lon"], resolved["label"]
 
         try:
-            data = fetch_onecall(lat, lon)
-        except (OpenWeatherClientError, requests.RequestException) as e:
-            logger.warning("One Call fetch failed for %r: %s", raw_location, e)
+            periods = fetch_nws_forecast(lat, lon)
+            alerts = fetch_nws_alerts(lat, lon)
+        except (WeatherClientError, requests.RequestException) as e:
+            logger.warning("NWS fetch failed for %r: %s", raw_location, e)
             continue
 
-        for alert in data.get("alerts", []):
+        for alert in alerts:
             doc = normalize_alert(alert, location_label)
             if doc:
                 documents.append(doc)
 
-        for day in data.get("daily", []):
-            doc = normalize_forecast_day(day, location_label, lat, lon)
+        for period in periods:
+            doc = normalize_forecast_period(period, location_label, lat, lon)
             if doc:
                 documents.append(doc)
 

@@ -47,14 +47,15 @@ def weather_sync():
     """
     Body: {"locations": ["Chicago", "Austin"], "limit": 50}
 
-    Harvests active alerts + forecast periods for each location via
+    Harvests NWS forecast prose + active alerts for each location via
     weather_client, normalizes them, and upserts into weather_documents.
     Returns the count of documents synced.
 
-    Locations are geocoded via OpenWeatherMap -- use plain city names or
-    "City, FullState" ("Chicago, Illinois"). The "City, ST" two-letter
-    abbreviation form returns 0 geocoding hits (e.g. "IL" is parsed as
-    the country code for Israel).
+    Locations are geocoded via the OpenWeatherMap Geocoding API -- use
+    plain city names or "City, FullState" ("Chicago, Illinois"). The
+    "City, ST" two-letter abbreviation form returns 0 geocoding hits
+    (e.g. "IL" is parsed as the country code for Israel). "lat,lon"
+    locations need no API key at all.
     """
     body = request.get_json(silent=True) or {}
     locations = body.get("locations")
@@ -69,11 +70,12 @@ def weather_sync():
         return jsonify({"error": "'limit' must be an integer"}), 400
     limit = max(1, min(limit, 500))  # sane bounds
 
-    if not weather_client.API_KEY:
+    if weather_client.needs_geocoding(locations) and not weather_client.API_KEY:
         return jsonify({
-            "error": "OPENWEATHER_API_KEY is not set on the server. Get a free "
-                     "key at https://openweathermap.org/api and set it before "
-                     "calling /weather/sync.",
+            "error": "OPENWEATHER_API_KEY is not set on the server, and some "
+                     "locations are place names that need geocoding. Either "
+                     "set the key (https://openweathermap.org/api) or pass "
+                     "'lat,lon' locations directly (NWS itself needs no key).",
         }), 500
 
     documents = weather_client.sync_locations(locations, limit=limit)
@@ -82,9 +84,9 @@ def weather_sync():
         return jsonify({
             "synced": 0,
             "message": "No documents harvested -- check that each location is "
-                       "geocodable by OpenWeatherMap (try 'City, Country' or "
-                       "pass 'lat,lon' directly) and that the One Call 3.0 "
-                       "subscription on your API key is active.",
+                       "geocodable (try 'City, Country' or pass 'lat,lon' "
+                       "directly) and that api.weather.gov is reachable "
+                       "(NWS blocks requests without a descriptive User-Agent).",
         }), 200
 
     upsert_documents(documents)

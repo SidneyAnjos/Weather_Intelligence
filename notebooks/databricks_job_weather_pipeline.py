@@ -4,7 +4,7 @@ notebooks/databricks_job_weather_pipeline.py
 Entry point for the scheduled Databricks Job. Runs the full
 harvest -> upsert -> embed cycle in one process:
 
-    1. weather_client.sync_locations(...)   -- hit OpenWeatherMap
+    1. weather_client.sync_locations(...)   -- harvest NWS forecast/alert prose
     2. db.upsert_documents(...)             -- write weather_documents
     3. ingest_weather_embeddings.run(...)   -- embed + write weather_embeddings
 
@@ -19,7 +19,7 @@ inside a notebook context -- see `_get_param()` below.
 
 Usage (local):
     python notebooks/databricks_job_weather_pipeline.py \
-        --locations "Chicago, IL" "Austin, TX" "Miami, FL" \
+        --locations Chicago Austin Miami \
         --limit 50 --batch-size 100
 """
 
