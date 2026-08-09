@@ -70,10 +70,6 @@ def _mock_response(json_data, status_code=200):
     return resp
 
 
-def _mock_get(side_effect):
-    return patch("weather_client.requests.get", side_effect=side_effect)
-
-
 def test_resolve_location_lat_lon_shortcut():
     coords = wc.resolve_location("41.88, -87.63")
     assert coords == {"lat": 41.88, "lon": -87.63, "label": "41.88, -87.63"}
@@ -155,7 +151,7 @@ def test_normalize_forecast_period_no_text_returns_none():
         "X", 0, 0) is None
 
 
-@_mock_get
+@patch("weather_client.requests.get")
 def test_sync_locations_end_to_end(mock_get):
     def side_effect(url, **kwargs):
         if url == wc.GEO_URL:
@@ -180,7 +176,7 @@ def test_sync_locations_end_to_end(mock_get):
     assert all(d["location"] == "Chicago, Illinois, US" for d in docs)
 
 
-@_mock_get
+@patch("weather_client.requests.get")
 def test_sync_locations_respects_limit(mock_get):
     def side_effect(url, **kwargs):
         if url == wc.GEO_URL:

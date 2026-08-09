@@ -48,39 +48,41 @@ search endpoint over it, mirroring the existing `ticker_news_documents` /
 | README | `README_WEATHER.md` (this file) |
 | *(new)* Scheduled re-sync | `notebooks/databricks_job_weather_pipeline.py` + `databricks.yml` (serverless Databricks Job, cron-scheduled) |
 
-## Data source: OpenWeatherMap One Call API 3.0
+## Data source: NWS (National Weather Service) + OWM geocoding
 
-Chosen over the National Weather Service API and the CPC discussion
-products because:
+Harvested data comes from the **National Weather Service** (`api.weather.gov`):
 
-- **Global coverage** — not limited to the US, so `locations` can be any
-  geocodable place name worldwide, not just US cities.
-- **Genuinely unstructured narrative text** in two flavors that give the
-  retrieval demo some contrast: `alerts` (government-issued alert
-  `description` text, often several sentences of hazard-specific
-  guidance) and `forecast` (the daily `summary` field, which
-  OpenWeatherMap generates as an actual prose sentence — e.g. "There
-  will be clear sky until morning, then partly cloudy" — rather than a
-  short tag).
-- **One call, two data types** — a single `/onecall` request returns
-  both current alerts and the multi-day forecast, so `sync_locations()`
-  only needs one HTTP round trip per location (plus one geocoding call
-  the first time a place name is resolved).
+- **Forecast** — `detailedForecast` on each forecast period is genuine
+  prose ("Showers and thunderstorms likely after noon. Partly sunny. High
+  near 81..."), which is exactly the unstructured free-text the search
+  is built on. 14 periods per city, refreshed regularly.
+- **Alerts** — active government alerts (`description`, with
+  `instruction` appended when present): multi-sentence hazard guidance.
 
-Trade-offs versus NWS:
-- **Requires an API key AND an active "One Call API 3.0" subscription.**
-  The key itself only gates geocoding; the `/data/3.0/onecall` endpoint
-  separately requires subscribing to the (free) One Call 3.0 plan in the
-  OpenWeatherMap dashboard (Pricing → One Call by Call → Free). New
-  subscriptions can take up to ~2 hours to start working.
+Place-name locations ("Chicago") are resolved to lat/lon via the
+**OpenWeatherMap Geocoding API** — a separate, free endpoint that does
+NOT require the One Call plan or a card-verified subscription. NWS data
+itself needs **no API key, no subscription, no credit card**.
+
+Why NWS instead of OpenWeatherMap's prose endpoints? OpenWeatherMap
+One Call 3.0 — the only endpoint that returns prose (`summary` +
+government alert text) — now demands a card-verified subscription even
+on its free tier, which wasn't an option here. NWS is also what the
+assignment recommends.
+
+Trade-offs of NWS:
+- **US-only coverage.** NWS only covers US territories, so `locations`
+  must be US places (the default list is 8 major US cities).
 - **Geocoding format quirk:** OpenWeatherMap's geocoder returns **0 hits
   for `"City, ST"` two-letter state abbreviations** (`"Chicago, IL"` — the
   `IL` is parsed as a country code, Israel). Use plain city names
   (`"Chicago"`) or `"City, FullState"` (`"Chicago, Illinois"`). This is
   baked into the default location list and documented in `app.py`.
-- **Alerts depend on the location having an active government alerts
-  feed OpenWeatherMap aggregates** — coverage/quality varies more by
-  country than NWS's US-only but uniformly structured alerts.
+- **Alerts are only present when an area actually has an active
+  alert** — on a quiet day you may harvest only forecasts. That's fine:
+  forecasts alone carry the pipeline.
+- **NWS requires a descriptive `User-Agent`** header; the bare default
+  client string gets HTTP 403. `weather_client.py` sets one.
 
 ## Schema
 
@@ -88,12 +90,12 @@ Trade-offs versus NWS:
 
 | column | notes |
 |---|---|
-| `id` | `alert:<hash of location+event+sender+start>` or `forecast:<hash of location+lat+lon+day timestamp>` — stable across re-syncs so upserts dedupe correctly |
+| `id` | `alert:<hash of location+event+sender+effective>` or `forecast:<hash of location+lat+lon+startTime>` — stable across re-syncs so upserts dedupe correctly |
 | `location` | resolved place label from OpenWeatherMap's Geocoding API (`"City, State, Country"`), falling back to a raw `"lat,lon"` string if that's what the caller passed in |
 | `source_type` | `alert` or `forecast` (checked via `CHECK` constraint) |
-| `headline` | alert `event` name, or `"<weekday>: <weather.main>"` (e.g. `"Friday: Rain"`) |
-| `narrative_text` | the actual free text to embed — alert `description` for alerts, daily `summary` (falling back to the short `weather[].description`) for forecasts |
-| `issued_at` | alert `start` (unix ts → ISO), or forecast day `dt` (unix ts → ISO) |
+| `headline` | alert `event` name, or the forecast period `name` (e.g. `"Today"`, `"Tonight"`, `"Saturday"`) |
+| `narrative_text` | the actual free text to embed — alert `description` (+ `instruction`) for alerts, `detailedForecast` (falling back to `shortForecast`) for forecasts |
+| `issued_at` | NWS `effective` (alerts) or period `startTime` (forecasts), ISO 8601 with tz offset |
 | `payload` | raw JSON feature/period, kept for provenance/debugging |
 | `synced_at` | last sync timestamp |
 
@@ -181,11 +183,11 @@ is documented in `requirements.txt` / `databricks.yml`.
 # 1. One-time: install deps
 pip install -r requirements.txt --break-system-packages
 
-# 2. Get a free API key at https://openweathermap.org/api AND activate the
-#    One Call API 3.0 subscription (Pricing -> One Call by Call -> Free).
-#    New keys/subscriptions can take up to ~2 hours to activate.
-export OPENWEATHER_API_KEY=...        # 32-hex key; a base64-wrapped key is auto-decoded
-export OPENWEATHER_UNITS=imperial    # or metric / standard
+# 2. Optional: set an OpenWeatherMap Geocoding key so place names like
+#    "Chicago" can be resolved to lat/lon. NWS data itself needs no key.
+#    If you pass "lat,lon" locations you can skip this entirely. A 32-hex
+#    key; a base64-wrapped key is auto-decoded.
+export OPENWEATHER_API_KEY=...
 
 # 3. Lakebase connection: either set a static password for a course/plain PG ...
 export LAKEBASE_HOST=<...>
@@ -259,10 +261,10 @@ duplicating rows.
 Validated for real against the live stack (not just mocks):
 
 1. **`weather_client.py`** — parsing/normalization tested against mocked
-   OpenWeatherMap responses (`tests/test_weather_client.py`, 12 tests).
-   Live validation confirmed the base64-key fix: the raw 44-char secret
-   401s, the auto-decoded 32-hex key geocodes with HTTP 200, and all 8
-   default locations resolve deterministically.
+   NWS + OWM geocoding responses (`tests/test_weather_client.py`, 15
+   tests, all green). Live validation confirmed the base64-key fix (raw
+   44-char secret 401s, auto-decoded 32-hex key geocodes with HTTP 200)
+   and that all 8 default locations resolve deterministically.
 2. **`lakebase.py` OAuth connection** — connects to the real Lakebase as
    the current user (`pgvector 0.8.0`, host resolved from the endpoint).
    `init_weather_schema()` creates `weather_documents` /
@@ -270,20 +272,20 @@ Validated for real against the live stack (not just mocks):
 3. **Serverless scheduled job** — deployed via the bundle and run for
    real: the serverless environment builds (`databricks_ml` base + source
    `psycopg2`/`sentence-transformers` deps), the in-job SDK fetches the
-   API key from secrets, the OAuth Lakebase connection resolves, the
-   schema/HNSW index is created, and the `all-MiniLM-L6-v2` model
-   downloads from Hugging Face. The run completes end-to-end.
-4. **OpenWeatherMap One Call 3.0** — the remaining gate: the key
-   geocodes but the `/data/3.0/onecall` endpoint returns 401 until the
-   free One Call 3.0 subscription is activated on the key. The moment it
-   activates, the same deployed job harvests real alerts + forecasts;
-   no code change is needed.
+   geocoding key from secrets, the OAuth Lakebase connection resolves,
+   the schema/HNSW index is created, and the `all-MiniLM-L6-v2` model
+   downloads from Hugging Face. A run synced **100 documents** across 7
+   US cities and wrote **109 chunk embeddings** to `weather_embeddings`.
+4. **pgvector search on real data** — a nearest-neighbor query returns
+   semantically sensible results (the "Today/Chicago" embedding matches
+   itself at distance 0.0, then the similar "Today" forecasts for New
+   York and Miami at ~0.11).
 
 ## Known limitations / what I'd improve with more time
 
-- **One Call 3.0 subscription is an external dependency** — the key
-  alone isn't enough; the free One Call plan must be activated in the
-  OpenWeatherMap dashboard, and can take up to ~2 hours to propagate.
+- **NWS is US-only** — `locations` must be US places. For global
+  coverage you'd need a paid data source (OpenWeatherMap One Call 3.0
+  requires a card-verified subscription even on the free tier).
 - **Geocoding format trap** — `"City, ST"` silently returns 0 hits.
   Callers must use plain city names or full state names; there's no
   graceful fallback yet.
