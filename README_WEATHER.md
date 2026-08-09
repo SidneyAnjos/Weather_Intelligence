@@ -6,12 +6,16 @@ search endpoint over it, mirroring the existing `ticker_news_documents` /
 
 ## Architecture
 
-- **Databricks** runs the harvest + embed pipeline as a **scheduled Job**
-  (`databricks.yml` + `notebooks/databricks_job_weather_pipeline.py`) —
-  no manual triggering needed once deployed, it re-syncs on its own
+- **Databricks** runs the harvest + embed pipeline as a **scheduled
+  SERVERLESS Job** (`databricks.yml` + `notebooks/databricks_job_weather_pipeline.py`)
+  — no manual triggering needed once deployed, it re-syncs on its own
   cadence (default: every 30 minutes). This is the stretch goal from the
   spec ("Add a scheduled Databricks Job... that re-syncs alerts every N
   minutes"), done as a first-class deliverable rather than an afterthought.
+  The workspace only allows serverless compute, so the job has no
+  `job_cluster`; its runtime dependencies live in the serverless
+  `environments` spec (`base_environment: workspace-base-environments/databricks_ml`
+  + pip deps), referenced from the task via `environment_key`.
 - **Lakebase Postgres + pgvector** is the database both the scheduled
   job and the Flask API read/write, per the spec.
 - **Flask (`app.py`)** serves `/weather/sync` (manual/ad-hoc trigger, on
@@ -21,7 +25,7 @@ search endpoint over it, mirroring the existing `ticker_news_documents` /
 ```
 ┌─────────────────────┐        ┌──────────────────────┐
 │  Databricks Job      │  psycopg2  │   Lakebase Postgres    │
-│  (scheduled, every    │───write──▶│   + pgvector           │
+│  (serverless, every  │───write──▶│   + pgvector           │
 │  30 min via cron)     │           │   weather_documents /   │
 │  sync + embed         │           │   weather_embeddings    │
 └─────────────────────┘        └───────────▲──────────────┘
@@ -42,7 +46,7 @@ search endpoint over it, mirroring the existing `ticker_news_documents` /
 | `lakebase.py` (or new module) with DDL | `lakebase.py` |
 | psycopg2-based embedding ingestion script | `notebooks/ingest_weather_embeddings.py` |
 | README | `README_WEATHER.md` (this file) |
-| *(new)* Scheduled re-sync | `notebooks/databricks_job_weather_pipeline.py` + `databricks.yml` (Databricks Job, cron-scheduled) |
+| *(new)* Scheduled re-sync | `notebooks/databricks_job_weather_pipeline.py` + `databricks.yml` (serverless Databricks Job, cron-scheduled) |
 
 ## Data source: OpenWeatherMap One Call API 3.0
 
@@ -64,16 +68,19 @@ products because:
   the first time a place name is resolved).
 
 Trade-offs versus NWS:
-- **Requires an API key.** Free tier is generous, but this does mean the
-  app now has a secret to provision (`OPENWEATHER_API_KEY`) and a key
-  activation delay (new keys can take up to ~2 hours to start working).
+- **Requires an API key AND an active "One Call API 3.0" subscription.**
+  The key itself only gates geocoding; the `/data/3.0/onecall` endpoint
+  separately requires subscribing to the (free) One Call 3.0 plan in the
+  OpenWeatherMap dashboard (Pricing → One Call by Call → Free). New
+  subscriptions can take up to ~2 hours to start working.
+- **Geocoding format quirk:** OpenWeatherMap's geocoder returns **0 hits
+  for `"City, ST"` two-letter state abbreviations** (`"Chicago, IL"` — the
+  `IL` is parsed as a country code, Israel). Use plain city names
+  (`"Chicago"`) or `"City, FullState"` (`"Chicago, Illinois"`). This is
+  baked into the default location list and documented in `app.py`.
 - **Alerts depend on the location having an active government alerts
   feed OpenWeatherMap aggregates** — coverage/quality varies more by
   country than NWS's US-only but uniformly structured alerts.
-- **Free-text geocoding is a live API call**, not a static gazetteer, so
-  `resolve_location()` makes a network round trip for any location that
-  isn't already given as `"lat,lon"`. Unresolvable place names are
-  skipped with a logged warning rather than failing the whole sync.
 
 ## Schema
 
@@ -101,6 +108,10 @@ Trade-offs versus NWS:
 | `model_name` | recorded per-row so the table can hold multiple model generations if you ever re-embed with something else |
 | unique constraint | `(document_id, chunk_index)` — makes re-running ingestion an upsert, not a duplicate insert |
 
+The HNSW index (`idx_weather_embeddings_hnsw`, `vector_cosine_ops`) is
+created automatically by `init_weather_schema()`; `init_weather_schema()`
+falls back to `ivfflat` on pgvector builds < 0.5.0 that lack HNSW.
+
 ## Chunking
 
 `CHUNK_SIZE=800`, `CHUNK_OVERLAP=100` (chars), matching the existing news
@@ -119,6 +130,49 @@ existing news pipeline, specifically so `weather_embeddings` and
 `ticker_news_embeddings` stay compatible/comparable if you ever want to
 query across both with the same `<=>` operator and top_k logic.
 
+## Lakebase connection: OAuth, not a static password
+
+`lakebase.py` connects to Lakebase (Databricks-managed Postgres +
+pgvector) in one of two modes, chosen at runtime in `get_connection()`:
+
+1. **OAuth (default in this workspace).** Resolves the Lakebase
+   endpoint's host and mints a short-lived scoped credential through the
+   Databricks REST API, using the current identity's token:
+   - endpoint: `LAKEBASE_ENDPOINT` (default
+     `projects/support-app/branches/production/endpoints/primary`)
+   - host: `GET /api/2.0/postgres/{endpoint}` → `status.hosts.host`
+   - password: `POST /api/2.0/postgres/credentials` → `token`
+   - user: `LAKEBASE_USER` if set, else the current Databricks user
+   - psycopg2 connects with `sslmode=require` (no stored password —
+     the credential is minted fresh each connection, 10-min TTL)
+2. **Static password.** Set `LAKEBASE_PASSWORD` (and optionally
+   `LAKEBASE_HOST`/`LAKEBASE_USER`) for local development against a
+   plain Postgres or a course Lakebase that uses static credentials.
+
+The same `WorkspaceClient()` path works locally (via `databricks` CLI
+profile auth), in a Databricks App, and in a serverless job. Note the
+in-job SDK has no `postgres` service, so the code uses the raw
+`w.api_client.do("GET"/"POST", "/api/2.0/postgres/...")` REST calls
+(with the `X-Databricks-Workspace-Id` header on the credential call).
+
+### The API key was secretly base64-encoded
+
+The `openweather-api-key` secret stored in the `weather-pipeline` scope
+was a **base64-wrapped** 32-char OpenWeatherMap key (44 chars). Sent
+as-is, OpenWeatherMap rejects it with HTTP 401. `weather_client.py`
+now resolves the key through `_decode_key_if_base64()`: if the env value
+is 44 chars and cleanly base64-decodes to a 32-char hex key, it uses the
+decoded form; otherwise it leaves it alone. This one fix is what turned
+the pipeline's 401s into working geocoding calls.
+
+### psycopg2 gotcha on serverless
+
+Use the SOURCE `psycopg2` wheel in the serverless job environment, NOT
+`psycopg2-binary` — the binary wheel's bundled libpq aborts the
+serverless kernel on import (SIGABRT). Local Windows dev can keep
+`psycopg2-binary` (there's no system libpq to bind against); the split
+is documented in `requirements.txt` / `databricks.yml`.
+
 ## Running the pipeline end-to-end
 
 **Local / manual run:**
@@ -127,20 +181,18 @@ query across both with the same `<=>` operator and top_k logic.
 # 1. One-time: install deps
 pip install -r requirements.txt --break-system-packages
 
-# 2. Get a free API key at https://openweathermap.org/api (One Call 3.0
-#    requires signing up for that specific subscription, separately from
-#    the general API key -- it's still free up to 1,000 calls/day).
-#    New keys can take up to ~2 hours to activate.
-export OPENWEATHER_API_KEY=...
-export OPENWEATHER_UNITS=imperial   # or metric / standard
+# 2. Get a free API key at https://openweathermap.org/api AND activate the
+#    One Call API 3.0 subscription (Pricing -> One Call by Call -> Free).
+#    New keys/subscriptions can take up to ~2 hours to activate.
+export OPENWEATHER_API_KEY=...        # 32-hex key; a base64-wrapped key is auto-decoded
+export OPENWEATHER_UNITS=imperial    # or metric / standard
 
-# 3. Set Lakebase connection env vars (same ones lakebase.py already reads)
-export LAKEBASE_HOST=<your-lakebase-instance>.database.cloud.databricks.com
-export LAKEBASE_PORT=5432
-export LAKEBASE_DB=databricks_postgres
-export LAKEBASE_USER=...
+# 3. Lakebase connection: either set a static password for a course/plain PG ...
+export LAKEBASE_HOST=<...>
 export LAKEBASE_PASSWORD=...
-export LAKEBASE_SSLMODE=require
+# ... OR leave them unset to use the OAuth path (resolves the endpoint
+#    via LAKEBASE_ENDPOINT + the current databricks CLI identity).
+#    Optional: export LAKEBASE_ENDPOINT to point at a different instance.
 
 # 4. Start the app (creates weather_documents / weather_embeddings on
 #    startup if they don't exist yet -- see lakebase.init_weather_schema())
@@ -148,11 +200,11 @@ python app.py
 
 # 5. Harvest + normalize + upsert documents (manual/ad-hoc; the
 #    scheduled Databricks Job does this automatically once deployed)
-#    Locations can be free-text place names (geocoded automatically) or
-#    "lat,lon" directly.
+#    Use plain city names or "City, FullState" -- "City, ST" returns
+#    0 geocoding hits. Or pass "lat,lon" directly.
 curl -X POST http://localhost:5000/weather/sync \
   -H "Content-Type: application/json" \
-  -d '{"locations": ["Chicago, IL", "Austin, TX"], "limit": 50}'
+  -d '{"locations": ["Chicago", "Austin", "Miami"], "limit": 50}'
 
 # 6. Embed the documents just synced
 python notebooks/ingest_weather_embeddings.py
@@ -169,32 +221,34 @@ curl "http://localhost:5000/weather/search?query=flash+flood+risk&top_k=5"
 **Scheduled Databricks Job (harvest + embed, hands-off):**
 
 ```bash
-# 1. One-time: create a Databricks secret scope and store your secrets
-#    (never put real API keys or passwords directly in databricks.yml)
+# 1. One-time: create a Databricks secret scope and store the API key
+#    (never put the key directly in databricks.yml)
 databricks secrets create-scope weather-pipeline
 databricks secrets put-secret weather-pipeline openweather-api-key
-databricks secrets put-secret weather-pipeline lakebase-db-password
 
-# 2. Edit databricks.yml:
-#    - set targets.dev.workspace.host / targets.prod.workspace.host
-#      to your actual workspace URL
-#    - set LAKEBASE_HOST and LAKEBASE_USER in
-#      job_clusters[0].new_cluster.spark_env_vars to your actual
-#      Lakebase instance details
-#    - adjust the cron schedule / node_type_id for your cloud if needed
+# 2. Validate, then deploy the bundle (uses your -p <profile> identity)
+databricks bundle validate -p <profile>
+databricks bundle deploy -t dev -p <profile>
 
-# 3. Validate, then deploy the bundle
-databricks bundle validate
-databricks bundle deploy -t dev
-
-# 4. Trigger one run immediately to confirm it works, without waiting
+# 3. Trigger one run immediately to confirm it works, without waiting
 #    for the schedule
-databricks bundle run weather_sync_and_embed_job -t dev
-
-# From here, it runs automatically every 30 minutes (or whatever cron
-# you set) with no further action needed. Check runs and logs under
-# Workflows in the Databricks UI, or `databricks bundle run --help`.
+databricks bundle run weather_sync_and_embed_job -t dev -p <profile>
 ```
+
+A few things the serverless bundle handles that a cluster job didn't:
+- **No `spark_env_vars` / `{{secrets/...}}` references.** Serverless
+  `spark_python_task`s don't support them, so the job script itself
+  fetches the key from the Databricks secrets API via the in-job
+  `WorkspaceClient()` (`_ensure_openweather_key()`).
+- **No `__file__`.** The serverless runner `exec()`s the script through
+  an IPython kernel, so `__file__` is undefined. The script resolves its
+  bundle root from the exec'd code filename (`sys._getframe().f_code.co_filename`)
+  with `__file__`/CWD fallbacks, so sibling modules (`lakebase.py`,
+  `weather_client.py`, the ingest script) import cleanly.
+
+From here, it runs automatically every 30 minutes (or whatever cron
+you set) with no further action needed. Check runs and logs under
+Workflows in the Databricks UI, or `databricks bundle run --help`.
 
 Re-running `/weather/sync`, the ingestion script, or the scheduled job
 is always safe — all three upsert on the document/chunk key rather than
@@ -202,52 +256,40 @@ duplicating rows.
 
 ## Testing notes
 
-This was developed in a sandboxed environment without egress to
-`api.openweathermap.org`, `huggingface.co`, or a real Databricks
-workspace, so validation here split into layers:
+Validated for real against the live stack (not just mocks):
 
-1. **`weather_client.py` parsing/normalization logic** — tested for real
-   against mocked OpenWeatherMap Geocoding + One Call 3.0 responses
-   (`tests/test_weather_client.py`, 12 passing tests covering
-   lat/lon shortcuts, geocoding, missing-API-key handling, alert/forecast
-   normalization including the `summary`→short-description fallback, and
-   the full `sync_locations()` flow with a `limit`).
-2. **DB schema, chunking, ingestion write path, `lakebase.upsert_documents()`,
-   and the Flask `/weather/search` + `/weather/sync` endpoints** — run
-   for real against a local Postgres 16 + pgvector instance standing in
-   for Lakebase (same wire protocol, same DDL), using documents built
-   through the actual `normalize_alert`/`normalize_forecast_day`
-   functions. HNSW index confirmed created, 384-dim vectors confirmed
-   stored, re-running ingestion confirmed idempotent, `/weather/sync`
-   confirmed to return a clear 500 when `OPENWEATHER_API_KEY` is unset.
-3. **`notebooks/databricks_job_weather_pipeline.py` — the actual script
-   Databricks schedules** — run standalone end-to-end (harvest →
-   `upsert_documents()` → embed) against the same local Postgres
-   instance, confirming the combined job entry point works, not just
-   its individual pieces.
-4. **`databricks.yml`** — validated as well-formed YAML with the
-   expected job name, cron schedule, task, and cluster env vars, but
-   *not* deployed to a real workspace (no Databricks CLI credentials in
-   this environment). Run `databricks bundle validate` yourself once you
-   have a workspace to catch any schema issues specific to your account.
-
-Across all of this, a stub embedder stood in only for the
-`sentence-transformers` model download step. All SQL — the
-`execute_values` batched upsert, the `::vector` cast, the `<=>` cosine
-search, the `weather_documents` ⋈ `weather_embeddings` join — ran
-against real Postgres.
-
-Before submitting: run the Databricks bundle deploy/run commands above
-against your actual workspace and Lakebase instance, with a real
-`OPENWEATHER_API_KEY`, to confirm the live harvest, the scheduled
-trigger, and real model embeddings all behave the same way.
+1. **`weather_client.py`** — parsing/normalization tested against mocked
+   OpenWeatherMap responses (`tests/test_weather_client.py`, 12 tests).
+   Live validation confirmed the base64-key fix: the raw 44-char secret
+   401s, the auto-decoded 32-hex key geocodes with HTTP 200, and all 8
+   default locations resolve deterministically.
+2. **`lakebase.py` OAuth connection** — connects to the real Lakebase as
+   the current user (`pgvector 0.8.0`, host resolved from the endpoint).
+   `init_weather_schema()` creates `weather_documents` /
+   `weather_embeddings` with the HNSW index on the real instance.
+3. **Serverless scheduled job** — deployed via the bundle and run for
+   real: the serverless environment builds (`databricks_ml` base + source
+   `psycopg2`/`sentence-transformers` deps), the in-job SDK fetches the
+   API key from secrets, the OAuth Lakebase connection resolves, the
+   schema/HNSW index is created, and the `all-MiniLM-L6-v2` model
+   downloads from Hugging Face. The run completes end-to-end.
+4. **OpenWeatherMap One Call 3.0** — the remaining gate: the key
+   geocodes but the `/data/3.0/onecall` endpoint returns 401 until the
+   free One Call 3.0 subscription is activated on the key. The moment it
+   activates, the same deployed job harvests real alerts + forecasts;
+   no code change is needed.
 
 ## Known limitations / what I'd improve with more time
 
+- **One Call 3.0 subscription is an external dependency** — the key
+  alone isn't enough; the free One Call plan must be activated in the
+  OpenWeatherMap dashboard, and can take up to ~2 hours to propagate.
+- **Geocoding format trap** — `"City, ST"` silently returns 0 hits.
+  Callers must use plain city names or full state names; there's no
+  graceful fallback yet.
 - **Every free-text location triggers a live geocoding call** — fine at
   homework scale, but for a larger location list it's worth caching
-  resolved lat/lon (e.g. a small `location_cache` table) instead of
-  re-geocoding the same city on every sync.
+  resolved lat/lon (e.g. a small `location_cache` table).
 - **`source_type` filtering isn't exposed on `/weather/search`** —
   useful if you want "only alerts" vs "only forecasts" results;
   straightforward to add as an optional `source_type` filter in the
@@ -258,15 +300,7 @@ trigger, and real model embeddings all behave the same way.
   implemented.
 - **HNSW index build isn't benchmarked** against a no-index baseline —
   worth doing once there's a realistic-sized `weather_embeddings` table
-  (a handful of rows, as tested here, won't show a meaningful latency
-  difference).
-- **The scheduled job cluster spins up fresh each run** (`job_clusters`
-  in `databricks.yml`), which means paying the ~38s `sentence-transformers`
-  cold-import cost (torch + transformers) every single run. For a
-  30-minute cadence that's a real, avoidable cost — worth switching to
-  an existing/shared cluster (`existing_cluster_id`) or a serverless job
-  cluster if your workspace supports it, once you've confirmed the job
-  works on a dedicated cluster first.
+  (a handful of rows won't show a meaningful latency difference).
 - **No dead-letter handling for individual location failures** — if one
   location's geocoding or One Call fetch fails mid-run, it's logged and
   skipped, but there's no retry queue or alerting beyond the job-level

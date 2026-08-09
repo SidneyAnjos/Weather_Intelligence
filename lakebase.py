@@ -15,7 +15,7 @@ import os
 import json
 import logging
 from contextlib import contextmanager
-from typing import List
+from typing import List, Optional, Tuple
 
 import psycopg2
 import psycopg2.extras
@@ -25,15 +25,92 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Connection config -- Lakebase Postgres
 # ---------------------------------------------------------------------------
-# Same env vars a Lakebase-backed Flask app typically expects. Adjust names
-# here if your reference app's lakebase.py uses different ones -- keep it
-# consistent with whatever /news/sync already reads from.
+# Two connection modes, chosen at runtime in get_connection():
+#
+#   1. OAuth (default in this workspace) -- resolves the Lakebase endpoint's
+#      connect host and mints a short-lived scoped credential through the
+#      Databricks REST API, using the current identity's token. Works the
+#      same from a Databricks App (the support_app pattern), a Databricks
+#      serverless Job (this workspace only allows serverless compute), or a
+#      local machine with databricks-cli auth. Requires LAKEBASE_ENDPOINT.
+#
+#   2. Static password -- set LAKEBASE_PASSWORD (and optionally LAKEBASE_HOST/
+#      USER) for local development against a plain Postgres or a course
+#      Lakebase that uses static credentials.
+#
+# psycopg2 gotcha: on Databricks serverless compute use the SOURCE `psycopg2`
+# wheel, NOT `psycopg2-binary` -- the binary wheel's bundled libpq aborts the
+# kernel on import. Local dev on Windows can keep psycopg2-binary (no system
+# libpq there); see requirements.txt / databricks.yml for the split.
+LAKEBASE_ENDPOINT = os.environ.get(
+    "LAKEBASE_ENDPOINT",
+    # The workspace Lakebase instance this homework targets (same one the
+    # support_app uses). Override LAKEBASE_ENDPOINT for a different instance.
+    "projects/support-app/branches/production/endpoints/primary",
+)
 LAKEBASE_HOST = os.environ.get("LAKEBASE_HOST", "localhost")
-LAKEBASE_PORT = os.environ.get("LAKEBASE_PORT", "5432")
+LAKEBASE_PORT = int(os.environ.get("LAKEBASE_PORT", "5432"))
 LAKEBASE_DB = os.environ.get("LAKEBASE_DB", "databricks_postgres")
-LAKEBASE_USER = os.environ.get("LAKEBASE_USER", "postgres")
+LAKEBASE_USER = os.environ.get("LAKEBASE_USER", "")
 LAKEBASE_PASSWORD = os.environ.get("LAKEBASE_PASSWORD", "")
 LAKEBASE_SSLMODE = os.environ.get("LAKEBASE_SSLMODE", "require")
+
+
+def _workspace_client():
+    """Lazily build a databricks-sdk WorkspaceClient (OAuth path only)."""
+    from databricks.sdk import WorkspaceClient
+    return WorkspaceClient()
+
+
+def _endpoint_host(client) -> str:
+    """Resolve the Lakebase endpoint's connect host via the postgres REST API."""
+    ep = client.api_client.do("GET", f"/api/2.0/postgres/{LAKEBASE_ENDPOINT}")
+    return ep["status"]["hosts"]["host"]
+
+
+def _mint_db_password(client) -> str:
+    """Mint a short-lived scoped credential to use as the DB password."""
+    cred = client.api_client.do(
+        "POST",
+        "/api/2.0/postgres/credentials",
+        headers={"X-Databricks-Workspace-Id": str(client.get_workspace_id())},
+        body={"endpoint": LAKEBASE_ENDPOINT, "ttl": "600s"},
+    )
+    return cred["token"]
+
+
+def _resolve_user(client) -> str:
+    if LAKEBASE_USER:
+        return LAKEBASE_USER
+    return client.current_user.me().user_name
+
+
+def _resolve_connection_params() -> Tuple[str, int, str, str, str]:
+    """
+    Returns (host, port, db, user, password) for psycopg2.connect().
+
+    Prefers a static password when set (local dev / course instance); otherwise
+    uses the OAuth path against the workspace Lakebase.
+    """
+    if LAKEBASE_PASSWORD:
+        return (LAKEBASE_HOST, LAKEBASE_PORT, LAKEBASE_DB,
+                LAKEBASE_USER or "postgres", LAKEBASE_PASSWORD)
+
+    if LAKEBASE_ENDPOINT:
+        client = _workspace_client()
+        host = _endpoint_host(client)
+        user = _resolve_user(client)
+        password = _mint_db_password(client)
+        logger.info(
+            "Lakebase connection resolved via OAuth endpoint %s (host=%s, user=%s)",
+            LAKEBASE_ENDPOINT, host, user,
+        )
+        return (host, LAKEBASE_PORT, LAKEBASE_DB, user, password)
+
+    # Nothing configured: keep the historical localhost defaults so the module
+    # stays importable and init_weather_schema() can run against a local PG.
+    return (LAKEBASE_HOST, LAKEBASE_PORT, LAKEBASE_DB,
+            LAKEBASE_USER or "postgres", LAKEBASE_PASSWORD)
 
 
 @contextmanager
@@ -44,12 +121,13 @@ def get_connection():
     exception. Mirrors the existing news pipeline's connection helper so
     weather code can be dropped into the same app without a new pattern.
     """
+    host, port, db, user, password = _resolve_connection_params()
     conn = psycopg2.connect(
-        host=LAKEBASE_HOST,
-        port=LAKEBASE_PORT,
-        dbname=LAKEBASE_DB,
-        user=LAKEBASE_USER,
-        password=LAKEBASE_PASSWORD,
+        host=host,
+        port=port,
+        dbname=db,
+        user=user,
+        password=password,
         sslmode=LAKEBASE_SSLMODE,
         cursor_factory=psycopg2.extras.RealDictCursor,
     )

@@ -17,6 +17,7 @@ Two narrative text sources map cleanly onto source_type:
 Public entry point: sync_locations(locations, limit) -> List[dict]
 """
 
+import base64
 import hashlib
 import logging
 import os
@@ -31,8 +32,30 @@ GEO_URL = "https://api.openweathermap.org/geo/1.0/direct"
 ONECALL_URL = "https://api.openweathermap.org/data/3.0/onecall"
 REQUEST_TIMEOUT = 15  # seconds
 
-API_KEY = os.environ.get("OPENWEATHER_API_KEY", "")
 UNITS = os.environ.get("OPENWEATHER_UNITS", "imperial")  # imperial | metric | standard
+
+
+def _decode_key_if_base64(raw: str) -> str:
+    """
+    OpenWeatherMap keys are 32 lowercase hex chars. The key stored in the
+    weather-pipeline Databricks secret scope is base64-wrapped (44 chars),
+    which the API rejects with 401 if sent as-is. If the raw value cleanly
+    base64-decodes to a 32-char hex key, use the decoded form; otherwise
+    return it unchanged so a legitimately-plain key is never mangled.
+    """
+    raw = (raw or "").strip()
+    if len(raw) != 44:  # base64 of a 32-byte value is exactly 44 chars
+        return raw
+    try:
+        decoded = base64.b64decode(raw, validate=True).decode("ascii")
+    except Exception:
+        return raw
+    if len(decoded) == 32 and all(c in "0123456789abcdef" for c in decoded):
+        return decoded
+    return raw
+
+
+API_KEY = _decode_key_if_base64(os.environ.get("OPENWEATHER_API_KEY", ""))
 
 
 class OpenWeatherClientError(Exception):

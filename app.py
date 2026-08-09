@@ -45,11 +45,16 @@ init_weather_schema()
 @app.route("/weather/sync", methods=["POST"])
 def weather_sync():
     """
-    Body: {"locations": ["Chicago, IL", "Austin, TX"], "limit": 50}
+    Body: {"locations": ["Chicago", "Austin"], "limit": 50}
 
     Harvests active alerts + forecast periods for each location via
     weather_client, normalizes them, and upserts into weather_documents.
     Returns the count of documents synced.
+
+    Locations are geocoded via OpenWeatherMap -- use plain city names or
+    "City, FullState" ("Chicago, Illinois"). The "City, ST" two-letter
+    abbreviation form returns 0 geocoding hits (e.g. "IL" is parsed as
+    the country code for Israel).
     """
     body = request.get_json(silent=True) or {}
     locations = body.get("locations")
