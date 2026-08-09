@@ -1,8 +1,115 @@
+# databricks.yml
+#
+# Databricks Asset Bundle definition for the weather intelligence pipeline.
+# Deploys notebooks/databricks_job_weather_pipeline.py as a scheduled
+# Databricks Job -- no manual clicking through the Jobs UI required.
+#
+# Deploy + run:
+#   databricks bundle validate
+#   databricks bundle deploy -t dev
+#   databricks bundle run weather_sync_and_embed_job -t dev
+#
+# The schedule is defined below (default: every 30 minutes). Once
+# deployed, it also runs automatically on that cadence without you
+# needing to trigger it manually.
+
+bundle:
+  name: weather-intelligence-pipeline
+
+variables:
+  locations:
+    description: Comma-separated list of locations to sync
+    default: "Chicago, IL,Austin, TX,Miami, FL,Phoenix, AZ,Seattle, WA,Denver, CO,New York, NY,Atlanta, GA"
+  limit:
+    description: Max documents to harvest per run
+    default: "100"
+  batch_size:
+    description: Documents per embedding batch
+    default: "100"
+
+resources:
+  jobs:
+    weather_sync_and_embed_job:
+      name: "Weather Intelligence: sync + embed"
+
+      # Every 30 minutes. Alerts can change quickly; forecasts change
+      # slowly, but re-syncing both together keeps the pipeline simple.
+      # Adjust the cron expression to match how fresh you need alerts to be.
+      schedule:
+        quartz_cron_expression: "0 */30 * * * ?"
+        timezone_id: "America/Chicago"
+        pause_status: UNPAUSED
+
+      # Notify on failure so a broken sync doesn't go unnoticed.
+      email_notifications:
+        on_failure:
+          - ${workspace.current_user.userName}
+
+      max_concurrent_runs: 1  # don't let a slow run overlap the next schedule tick
+
+      tasks:
+        - task_key: sync_and_embed
+          job_cluster_key: weather_job_cluster
+          spark_python_task:
+            python_file: ../notebooks/databricks_job_weather_pipeline.py
+            parameters:
+              - "--locations"
+              - "${var.locations}"
+              - "--limit"
+              - "${var.limit}"
+              - "--batch-size"
+              - "${var.batch_size}"
+          libraries:
+            - pypi:
+                package: psycopg2-binary>=2.9
+            - pypi:
+                package: sentence-transformers>=3.0
+            - pypi:
+                package: requests>=2.31
+
+      job_clusters:
+        - job_cluster_key: weather_job_cluster
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"  # swap for your cloud's small general-purpose node type
+            num_workers: 0  # single-node cluster; this job is I/O bound (API calls + Postgres), not compute-heavy
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+            # Secrets referenced here must exist in a Databricks secret
+            # scope first:
+            #   databricks secrets create-scope weather-pipeline
+            #   databricks secrets put-secret weather-pipeline openweather-api-key
+            #   databricks secrets put-secret weather-pipeline lakebase-db-password
+            #
+            # Note: this uses a static password, matching the simple
+            # get_connection()/psycopg2 pattern the homework spec asks
+            # for. Lakebase also supports short-lived OAuth database
+            # credentials via a service principal (better for
+            # production), but that's a larger change to lakebase.py's
+            # connection logic than this homework needs.
+            spark_env_vars:
+              OPENWEATHER_API_KEY: "{{secrets/weather-pipeline/openweather-api-key}}"
+              LAKEBASE_HOST: "<your-lakebase-instance>.database.cloud.databricks.com"
+              LAKEBASE_PORT: "5432"
+              LAKEBASE_DB: "databricks_postgres"
+              LAKEBASE_USER: "<your-lakebase-user>"
+              LAKEBASE_PASSWORD: "{{secrets/weather-pipeline/lakebase-db-password}}"
+              LAKEBASE_SSLMODE: "require"
+
 targets:
-  default:
+  dev:
     mode: development
     default: true
     workspace:
-      host: https://dbc-1e8b237a-8e29.cloud.databricks.com
-bundle:
-  name: weather-intelligence-pipeline
+      host: https://<your-workspace>.cloud.databricks.com
+
+  prod:
+    mode: production
+    workspace:
+      host: https://<your-workspace>.cloud.databricks.com
+    run_as:
+      user_name: ${workspace.current_user.userName}

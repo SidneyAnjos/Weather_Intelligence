@@ -1,0 +1,5 @@
+Flask>=3.0
+requests>=2.31
+psycopg2-binary>=2.9
+sentence-transformers>=3.0
+numpy>=1.26
